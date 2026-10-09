@@ -1,0 +1,18 @@
+import express from 'express';
+import CategoryController from './category.controller';
+import { authMiddleware, authorizeRoles } from '../../middlewares/auth';
+import validateRequest from '../../middlewares/validateRequest';
+import { publicCache } from '../../middlewares/publicCache';
+import { createCategoryValidation, updateCategoryValidation } from './category.validation';
+
+const router = express.Router();
+
+router.get('/', publicCache(60), CategoryController.getAll);
+router.get('/admin/all', authMiddleware, authorizeRoles('admin', 'editor'), CategoryController.getAllAdmin);
+router.get('/:id/subcategories', CategoryController.getSubCategories);
+router.get('/:id', CategoryController.getById);
+router.post('/', authMiddleware, authorizeRoles('admin'), validateRequest(createCategoryValidation), CategoryController.create);
+router.patch('/:id', authMiddleware, authorizeRoles('admin'), validateRequest(updateCategoryValidation), CategoryController.update);
+router.delete('/:id', authMiddleware, authorizeRoles('admin'), CategoryController.delete);
+
+export const CategoryRoutes = router;

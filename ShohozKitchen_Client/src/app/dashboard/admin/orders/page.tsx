@@ -1,0 +1,489 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+"use client";
+
+import React, { useState, useEffect, Suspense } from 'react';
+import { useSearchParams } from 'next/navigation';
+import Link from 'next/link';
+import { LuPlus, LuDownload, LuEye, LuExternalLink, LuStickyNote, LuX, LuPackage, LuBarcode, LuReceiptText, LuRepeat } from 'react-icons/lu';
+import {
+    useGetAdminOrdersQuery,
+    useUpdateOrderStatusMutation,
+    useUpdatePaymentStatusMutation,
+    useGetOrderStatsQuery,
+    useAddAdminNoteMutation,
+} from '@/redux/api/orderApi';
+import { useGetProductsQuery } from '@/redux/api/productApi';
+import { toast } from 'react-hot-toast';
+import { ORDER_STATUS_CONFIG, getStatusConfig, paymentMethodLabel } from '@/lib/orderStatus';
+import {
+    PageHeader, Btn, SearchInput, SelectPill, FilterBar, StatTile, Badge, BadgeSelect, TableCard,
+    TH, TD, TR, EmptyRow, SkeletonRows, RowMenu, Modal, TEXTAREA, taka, fmtDateTime, cx, type Tone,
+} from '@/components/admin/ui';
+import PrintOrdersModal, { type PrintJob, type PrintKind } from '@/components/admin/print/PrintOrdersModal';
+import { useSelector } from 'react-redux';
+import { RootState } from '@/redux/store';
+
+// Orders load 50 at a time and "See more" adds the next 50 BELOW the ones already
+// shown, so a long selection for printing or a bulk status change is never split
+// across pages.
+const PAGE_SIZE = 50;
+
+/**
+ * Same phone, same day. Two parcels to one customer are paid for twice at the courier
+ * and are often one order placed again by mistake, so the row links straight to the
+ * other order. The server works this out (repeatToday on each order).
+ */
+function RepeatTodayChip({ info }: { info?: { count: number; position: number; other: { _id: string; orderId: string } } | null }) {
+    if (!info?.other?._id) return null;
+    const nth = (n: number) => (n === 1 ? '1st' : n === 2 ? '2nd' : n === 3 ? '3rd' : `${n}th`);
+    const label = info.position > 1 ? `${nth(info.position)} order today` : `1st of ${info.count} today`;
+    return (
+        <Link
+            href={`/dashboard/admin/orders/${info.other._id}`}
+            title={`Same phone ordered ${info.count} times today — open ${info.other.orderId}`}
+            className="mt-1 inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700 ring-1 ring-amber-200 transition hover:bg-amber-100"
+        >
+            <LuRepeat size={11} /> {label}
+        </Link>
+    );
+}
+
+const ORDER_TONE: Record<string, Tone> = {
+    pending: 'amber', confirmed: 'blue', processing: 'purple', shipped: 'indigo', on_the_way: 'sky',
+    out_for_delivery: 'teal', delivery_attempt: 'orange', delivered: 'green', cancelled: 'red',
+    returned: 'gray', refunded: 'rose',
+};
+
+const PAYMENT: Record<string, { label: string; tone: Tone }> = {
+    pending: { label: 'Unpaid', tone: 'red' },
+    paid: { label: 'Paid', tone: 'green' },
+    failed: { label: 'Failed', tone: 'red' },
+    refunded: { label: 'Refunded', tone: 'purple' },
+};
+
+const STATUS_OPTIONS = Object.entries(ORDER_STATUS_CONFIG).map(([value, cfg]) => ({ value, label: cfg.label }));
+const PAYMENT_OPTIONS = Object.entries(PAYMENT).map(([value, p]) => ({ value, label: p.label }));
+
+const customerName = (o: any) =>
+    o.shippingAddress?.fullName || `${o.user?.firstName || ''} ${o.user?.lastName || ''}`.trim() || 'Guest';
+const customerPhone = (o: any) => o.shippingAddress?.phone || o.user?.phone || '';
+const parcelId = (o: any) => (o.packages || []).map((p: any) => p.consignmentId).filter(Boolean).join(', ');
+
+/** What has been paid and what is still owed on an order. */
+function money(o: any) {
+    const total = Number(o.total || 0);
+    if (o.paymentStatus === 'paid') return { paid: total, due: 0 };
+    if (o.paymentStatus === 'refunded') return { paid: 0, due: 0, refunded: true };
+    // A cancelled order is owed nothing.
+    if (o.status === 'cancelled') return { paid: 0, due: 0 };
+    return { paid: 0, due: total };
+}
+
+function useDebounced<T>(value: T, ms = 300) {
+    const [v, setV] = useState(value);
+    useEffect(() => { const t = setTimeout(() => setV(value), ms); return () => clearTimeout(t); }, [value, ms]);
+    return v;
+}
+
+// useSearchParams needs a Suspense boundary (Next.js falls back to client rendering up to it).
+export default function OrdersPage() {
+    return (
+        <Suspense fallback={null}>
+            <OrdersPageInner />
+        </Suspense>
+    );
+}
+
+function OrdersPageInner() {
+    // ?status=pending (the Dashboard's links) pre-selects the status filter.
+    const statusParam = useSearchParams().get('status');
+    const [search, setSearch] = useState('');
+    const [statusFilter, setStatusFilter] = useState(
+        statusParam && Object.prototype.hasOwnProperty.call(ORDER_STATUS_CONFIG, statusParam) ? statusParam : 'all',
+    );
+    const [paymentFilter, setPaymentFilter] = useState('all');
+    const [productFilter, setProductFilter] = useState('all');
+    const [visible, setVisible] = useState(PAGE_SIZE);
+    const [selected, setSelected] = useState<Set<string>>(new Set());
+    const [bulkStatus, setBulkStatus] = useState('');
+    const [noteFor, setNoteFor] = useState<any>(null);
+    const [noteText, setNoteText] = useState('');
+    const [printJob, setPrintJob] = useState<PrintJob | null>(null);
+    const q = useDebounced(search);
+
+    const { data: ordersData, isLoading, isFetching } = useGetAdminOrdersQuery({
+        page: 1,
+        limit: visible,
+        status: statusFilter !== 'all' ? statusFilter : undefined,
+        paymentStatus: paymentFilter !== 'all' ? paymentFilter : undefined,
+        'items.product': productFilter !== 'all' ? productFilter : undefined,
+        searchTerm: q || undefined,
+    });
+    const { data: statsData } = useGetOrderStatsQuery({});
+    const { data: productsData } = useGetProductsQuery({ limit: 200, sort: 'name', fields: 'name' });
+    const [updateStatus] = useUpdateOrderStatusMutation();
+    const [updatePayment] = useUpdatePaymentStatusMutation();
+    // Editors confirm orders and print; payments and creating orders are for admins.
+    const isEditor = useSelector((s: RootState) => s.auth.user?.role) === 'editor';
+    const [addNote, { isLoading: isSavingNote }] = useAddAdminNoteMutation();
+
+    const orders: any[] = ordersData?.data || [];
+    const meta = ordersData?.meta || { total: 0, totalPages: 1 };
+    const stats = statsData?.data || {};
+    const products: any[] = productsData?.data || [];
+
+    // Any change of filter goes back to the first 50 and starts a fresh selection.
+    const resetPage = () => { setVisible(PAGE_SIZE); setSelected(new Set()); };
+    const hasMore = orders.length < (meta.total || 0);
+
+    const handleStatusChange = async (orderId: string, newStatus: string) => {
+        try {
+            await updateStatus({ id: orderId, status: newStatus }).unwrap();
+            toast.success(`Status changed to ${getStatusConfig(newStatus).label}`);
+        } catch (err: any) {
+            toast.error(err?.data?.message || 'Failed to update status');
+        }
+    };
+
+    const handlePaymentChange = async (orderId: string, newStatus: string) => {
+        try {
+            await updatePayment({ id: orderId, paymentStatus: newStatus }).unwrap();
+            toast.success(`Payment marked ${PAYMENT[newStatus]?.label || newStatus}`);
+        } catch (err: any) {
+            toast.error(err?.data?.message || 'Failed to update payment');
+        }
+    };
+
+    const exportOrdersCsv = (list: any[], suffix: string) => {
+        if (!list.length) { toast.error('No orders to export'); return; }
+        const headers = ['Order No', 'Parcel', 'Customer', 'Phone', 'Items', 'Total', 'Paid', 'Due', 'Payment Method', 'Payment Status', 'Status', 'Placed'];
+        const escapeCell = (val: any) => {
+            const s = String(val ?? '');
+            return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+        };
+        const rows = list.map((o: any) => {
+            const m = money(o);
+            return [
+                o.orderId || o._id, parcelId(o), customerName(o), customerPhone(o),
+                o.items?.length || 0, o.total ?? 0, m.paid, m.due,
+                o.paymentMethod ? paymentMethodLabel(o.paymentMethod) : '',
+                PAYMENT[o.paymentStatus]?.label || o.paymentStatus || '',
+                getStatusConfig(o.status).label,
+                o.createdAt ? new Date(o.createdAt).toLocaleString() : '',
+            ];
+        });
+        const csv = [headers, ...rows].map((r) => r.map(escapeCell).join(',')).join('\n');
+        const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `orders-${suffix}-${new Date().toISOString().slice(0, 10)}.csv`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+        toast.success(`Exported ${list.length} orders`);
+    };
+
+    // ── Bulk selection ──
+    const allSelected = orders.length > 0 && orders.every((o: any) => selected.has(o._id));
+    const someSelected = selected.size > 0 && !allSelected;
+
+    const toggleOne = (id: string) => setSelected((prev) => {
+        const next = new Set(prev);
+        if (next.has(id)) next.delete(id); else next.add(id);
+        return next;
+    });
+    const toggleAll = () => setSelected((prev) => {
+        const next = new Set(prev);
+        if (orders.every((o: any) => next.has(o._id))) orders.forEach((o: any) => next.delete(o._id));
+        else orders.forEach((o: any) => next.add(o._id));
+        return next;
+    });
+    const clearSelection = () => setSelected(new Set());
+
+    // Labels / invoices for the selected orders, in the order the table shows them.
+    const printSelected = (kind: PrintKind) => {
+        const shown = orders.filter((o: any) => selected.has(o._id)).map((o: any) => o._id as string);
+        const others = Array.from(selected).filter((id) => !shown.includes(id));
+        setPrintJob({ kind, ids: [...shown, ...others] });
+    };
+
+    const handleBulkStatus = async (newStatus: string) => {
+        const ids = Array.from(selected);
+        if (!ids.length || !newStatus) return;
+        const tId = toast.loading(`Updating ${ids.length} order${ids.length > 1 ? 's' : ''}…`);
+        const results = await Promise.allSettled(ids.map((id) => updateStatus({ id, status: newStatus }).unwrap()));
+        const ok = results.filter((r) => r.status === 'fulfilled').length;
+        const failed = results.length - ok;
+        if (ok > 0) toast.success(`Updated ${ok} order${ok > 1 ? 's' : ''} to ${getStatusConfig(newStatus).label}${failed ? ` · ${failed} failed` : ''}`, { id: tId });
+        else toast.error('Could not update the selected orders', { id: tId });
+        clearSelection();
+        setBulkStatus('');
+    };
+
+    const saveNote = async () => {
+        if (!noteText.trim()) { toast.error('Write a note first'); return; }
+        try {
+            await addNote({ id: noteFor._id, note: noteText.trim() }).unwrap();
+            toast.success('Note added to the order timeline');
+            setNoteFor(null);
+            setNoteText('');
+        } catch (err: any) {
+            toast.error(err?.data?.message || 'Failed to add note');
+        }
+    };
+
+    const tiles = [
+        { key: 'all', label: 'All orders', value: stats.total },
+        { key: 'pending', label: 'Pending', value: stats.pending },
+        { key: 'confirmed', label: 'Confirmed', value: stats.confirmed },
+        { key: 'processing', label: 'Processing', value: stats.processing },
+        { key: 'shipped', label: 'Shipped', value: stats.shipped },
+        { key: 'delivered', label: 'Delivered', value: stats.delivered },
+        { key: 'cancelled', label: 'Cancelled', value: stats.cancelled },
+    ];
+
+    const rowMenu = (o: any) => (
+        <RowMenu items={[
+            { label: 'Open full page', icon: <LuExternalLink size={15} />, href: `/dashboard/admin/orders/${o._id}` },
+            { label: 'Add note', icon: <LuStickyNote size={15} />, onClick: () => { setNoteFor(o); setNoteText(''); } },
+            { label: 'Print label', icon: <LuBarcode size={15} />, onClick: () => setPrintJob({ kind: 'labels', ids: [o._id] }) },
+            { label: 'Print invoice', icon: <LuReceiptText size={15} />, onClick: () => setPrintJob({ kind: 'invoices', ids: [o._id] }) },
+        ]} />
+    );
+
+    return (
+        <div>
+            <PageHeader
+                title="Orders"
+                subtitle="Customer sales orders - from the store and taken by phone."
+                actions={<>
+                    <Btn icon={<LuDownload size={15} />} onClick={() => exportOrdersCsv(orders, 'orders')}>Export</Btn>
+                    <Btn variant="primary" icon={<LuPlus size={16} />} href="/dashboard/admin/orders/new">New order</Btn>
+                </>}
+            />
+
+            <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-7">
+                {tiles.map((t) => (
+                    <StatTile
+                        key={t.key}
+                        label={t.label}
+                        value={(t.value || 0).toLocaleString('en-IN')}
+                        active={statusFilter === t.key}
+                        onClick={() => { setStatusFilter(t.key); resetPage(); }}
+                    />
+                ))}
+            </div>
+
+            <FilterBar>
+                <SearchInput value={search} onChange={(v) => { setSearch(v); resetPage(); }} placeholder="Search order no, customer, phone…" />
+                <SelectPill ariaLabel="Status" className="sm:w-44" value={statusFilter} onChange={(v) => { setStatusFilter(v); resetPage(); }}
+                    options={[{ value: 'all', label: 'All statuses' }, ...STATUS_OPTIONS]} />
+                <SelectPill ariaLabel="Payment" className="sm:w-40" value={paymentFilter} onChange={(v) => { setPaymentFilter(v); resetPage(); }}
+                    options={[{ value: 'all', label: 'All payments' }, ...PAYMENT_OPTIONS]} />
+                <SelectPill ariaLabel="Product" className="sm:w-56" value={productFilter} onChange={(v) => { setProductFilter(v); resetPage(); }}
+                    options={[{ value: 'all', label: 'All products' }, ...products.map((p) => ({ value: p._id, label: p.name }))]} />
+            </FilterBar>
+
+            {/* Bulk action bar */}
+            {selected.size > 0 && (
+                <div className="mb-4 flex flex-col gap-3 rounded-2xl border border-[var(--color-primary-border)] bg-[var(--color-primary-lightest)] px-4 py-3 sm:flex-row sm:items-center">
+                    <p className="text-sm font-medium text-gray-800">
+                        <span className="mr-2 inline-flex h-6 min-w-6 items-center justify-center rounded-full bg-[var(--color-primary)] px-2 text-xs text-white">{selected.size}</span>
+                        order{selected.size > 1 ? 's' : ''} selected
+                    </p>
+                    <div className="flex flex-wrap items-center gap-2 sm:ml-auto">
+                        <SelectPill
+                            ariaLabel="Change status"
+                            className="w-48"
+                            value={bulkStatus}
+                            onChange={handleBulkStatus}
+                            options={[{ value: '', label: 'Change status to…' }, ...STATUS_OPTIONS]}
+                        />
+                        <Btn icon={<LuBarcode size={15} />} onClick={() => printSelected('labels')}>Print labels</Btn>
+                        <Btn icon={<LuReceiptText size={15} />} onClick={() => printSelected('invoices')}>Print invoices</Btn>
+                        <Btn icon={<LuDownload size={15} />} onClick={() => exportOrdersCsv(orders.filter((o) => selected.has(o._id)), 'selected')}>Export selected</Btn>
+                        <Btn variant="ghost" icon={<LuX size={15} />} onClick={clearSelection}>Clear</Btn>
+                    </div>
+                </div>
+            )}
+
+            <TableCard
+                className="hidden lg:block"
+                footer={null}
+            >
+                <table className={cx('w-full', isFetching && !isLoading && 'opacity-60')}>
+                    <thead>
+                        <tr>
+                            <th className={`${TH} w-10`}>
+                                <input
+                                    type="checkbox"
+                                    aria-label="Select all orders shown"
+                                    ref={(el) => { if (el) el.indeterminate = someSelected; }}
+                                    checked={allSelected}
+                                    onChange={toggleAll}
+                                    className="h-4 w-4 cursor-pointer rounded border-gray-300 accent-[var(--color-primary)]"
+                                />
+                            </th>
+                            <th className={`${TH} w-10`}>#</th>
+                            <th className={TH}>Order No</th>
+                            <th className={TH}>Customer</th>
+                            <th className={TH}>Status</th>
+                            <th className={TH}>Payment</th>
+                            <th className={`${TH} text-right`}>Items</th>
+                            <th className={`${TH} text-right`}>Total</th>
+                            <th className={`${TH} text-right`}>Paid / due</th>
+                            <th className={TH}>Placed</th>
+                            <th className={`${TH} w-20`} />
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {isLoading ? <SkeletonRows cols={11} /> : orders.length === 0 ? (
+                            <EmptyRow colSpan={11}>
+                                <LuPackage size={28} className="mx-auto mb-2 text-gray-300" />
+                                No orders match these filters.
+                            </EmptyRow>
+                        ) : orders.map((o, i) => {
+                            const m = money(o);
+                            const pay = PAYMENT[o.paymentStatus] || PAYMENT.pending;
+                            const itemCount = (o.items || []).reduce((n: number, it: any) => n + (it.quantity || 0), 0);
+                            return (
+                                <tr key={o._id} className={cx(TR, selected.has(o._id) && 'bg-[var(--color-primary-lightest)] hover:bg-[var(--color-primary-lightest)]')}>
+                                    <td className={TD}>
+                                        <input
+                                            type="checkbox"
+                                            aria-label="Select order"
+                                            checked={selected.has(o._id)}
+                                            onChange={() => toggleOne(o._id)}
+                                            className="h-4 w-4 cursor-pointer rounded border-gray-300 accent-[var(--color-primary)]"
+                                        />
+                                    </td>
+                                    <td className={`${TD} text-gray-400`}>{i + 1}</td>
+                                    <td className={TD}>
+                                        <Link href={`/dashboard/admin/orders/${o._id}`} className="font-semibold text-gray-900 hover:text-[var(--color-primary)]">{o.orderId}</Link>
+                                        <p className="mt-0.5 text-xs text-gray-400" title="Steadfast consignment">{parcelId(o) || 'Not booked'}</p>
+                                        <RepeatTodayChip info={o.repeatToday} />
+                                    </td>
+                                    <td className={TD}>
+                                        <p className="max-w-[180px] truncate text-gray-900">{customerName(o)}</p>
+                                        <p className="mt-0.5 text-xs text-gray-400">{customerPhone(o)}</p>
+                                    </td>
+                                    <td className={TD}>
+                                        <BadgeSelect ariaLabel="Order status" tone={ORDER_TONE[o.status] || 'gray'} value={o.status || 'pending'}
+                                            onChange={(v) => handleStatusChange(o._id, v)} options={STATUS_OPTIONS} />
+                                    </td>
+                                    <td className={TD}>
+                                        {isEditor ? <Badge tone={pay.tone}>{pay.label}</Badge> : (
+                                        <BadgeSelect ariaLabel="Payment status" tone={pay.tone} value={o.paymentStatus || 'pending'}
+                                            onChange={(v) => handlePaymentChange(o._id, v)} options={PAYMENT_OPTIONS} />
+                                        )}
+                                        <p className="mt-1 text-xs text-gray-400">{o.paymentMethod ? paymentMethodLabel(o.paymentMethod) : '—'}</p>
+                                    </td>
+                                    <td className={`${TD} text-right`} title={(o.items || []).map((it: any) => `${it.quantity} × ${it.name}`).join('\n')}>{itemCount}</td>
+                                    <td className={`${TD} whitespace-nowrap text-right font-medium text-gray-900`}>{taka(o.total)}</td>
+                                    <td className={`${TD} whitespace-nowrap text-right`}>
+                                        {m.refunded ? <span className="text-gray-400">refunded</span> : <>
+                                            <span className="text-gray-900">{taka(m.paid)}</span>
+                                            <span className={cx('block text-xs', m.due > 0 ? 'text-gray-400' : 'text-emerald-600')}>
+                                                {m.due > 0 ? `due ${taka(m.due)}` : 'settled'}
+                                            </span>
+                                        </>}
+                                    </td>
+                                    <td className={`${TD} whitespace-nowrap text-gray-500`}>{fmtDateTime(o.createdAt)}</td>
+                                    <td className={`${TD} whitespace-nowrap text-right`}>
+                                        <Link href={`/dashboard/admin/orders/${o._id}`} aria-label="View order" className="inline-flex h-8 w-8 items-center justify-center rounded-full text-gray-500 hover:bg-gray-100 hover:text-gray-800">
+                                            <LuEye size={16} />
+                                        </Link>
+                                        {rowMenu(o)}
+                                    </td>
+                                </tr>
+                            );
+                        })}
+                    </tbody>
+                </table>
+            </TableCard>
+
+            {/* Phones & tablets: cards */}
+            <div className="space-y-3 lg:hidden">
+                {isLoading ? Array.from({ length: 4 }).map((_, i) => <div key={i} className="h-36 animate-pulse rounded-2xl bg-gray-100" />)
+                    : orders.length === 0 ? (
+                        <div className="rounded-2xl border border-gray-200 px-4 py-12 text-center text-sm text-gray-500">No orders match these filters.</div>
+                    ) : orders.map((o) => {
+                        const m = money(o);
+                        const pay = PAYMENT[o.paymentStatus] || PAYMENT.pending;
+                        return (
+                            <div key={o._id} className={cx('rounded-2xl border bg-white p-4', selected.has(o._id) ? 'border-[var(--color-primary-border)] bg-[var(--color-primary-lightest)]' : 'border-gray-200')}>
+                                <div className="flex items-start justify-between gap-3">
+                                    <div className="flex min-w-0 items-start gap-2.5">
+                                        <input type="checkbox" aria-label="Select order" checked={selected.has(o._id)} onChange={() => toggleOne(o._id)}
+                                            className="mt-1 h-4 w-4 shrink-0 cursor-pointer rounded border-gray-300 accent-[var(--color-primary)]" />
+                                        <div className="min-w-0">
+                                            <Link href={`/dashboard/admin/orders/${o._id}`} className="font-semibold text-gray-900">{o.orderId}</Link>
+                                            <p className="text-xs text-gray-400">{fmtDateTime(o.createdAt)}</p>
+                                            <RepeatTodayChip info={o.repeatToday} />
+                                        </div>
+                                    </div>
+                                    {rowMenu(o)}
+                                </div>
+                                <div className="mt-3 flex items-end justify-between gap-3">
+                                    <div className="min-w-0">
+                                        <p className="truncate text-sm text-gray-900">{customerName(o)}</p>
+                                        <p className="text-xs text-gray-400">{customerPhone(o)}{parcelId(o) && ` · ${parcelId(o)}`}</p>
+                                    </div>
+                                    <div className="shrink-0 text-right">
+                                        <p className="font-semibold text-gray-900">{taka(o.total)}</p>
+                                        {!m.refunded && <p className="text-xs text-gray-400">{m.due > 0 ? `due ${taka(m.due)}` : 'settled'}</p>}
+                                    </div>
+                                </div>
+                                <div className="mt-3 flex flex-wrap items-center gap-2">
+                                    <BadgeSelect ariaLabel="Order status" tone={ORDER_TONE[o.status] || 'gray'} value={o.status || 'pending'}
+                                        onChange={(v) => handleStatusChange(o._id, v)} options={STATUS_OPTIONS} />
+                                    {isEditor ? <Badge tone={pay.tone}>{pay.label}</Badge> : (
+                                    <BadgeSelect ariaLabel="Payment status" tone={pay.tone} value={o.paymentStatus || 'pending'}
+                                        onChange={(v) => handlePaymentChange(o._id, v)} options={PAYMENT_OPTIONS} />
+                                    )}
+                                    <span className="text-xs text-gray-400">{o.paymentMethod ? paymentMethodLabel(o.paymentMethod) : ''}</span>
+                                </div>
+                            </div>
+                        );
+                    })}
+            </div>
+
+            <div className="mt-4 flex flex-col items-center justify-between gap-3 sm:flex-row">
+                <p className="text-sm text-gray-500">
+                    {meta.total === 0 ? 'No orders' : `Showing ${orders.length} of ${(meta.total || 0).toLocaleString('en-IN')} orders`}
+                </p>
+                {hasMore && (
+                    <Btn onClick={() => setVisible((n) => n + PAGE_SIZE)} disabled={isFetching}>
+                        {isFetching ? 'Loading…' : `See more (${Math.min(PAGE_SIZE, (meta.total || 0) - orders.length)})`}
+                    </Btn>
+                )}
+            </div>
+
+            <Modal
+                open={!!noteFor}
+                onClose={() => setNoteFor(null)}
+                title="Add note"
+                subtitle={noteFor ? `${noteFor.orderId} · ${customerName(noteFor)}` : ''}
+                width="max-w-md"
+                footer={<>
+                    <Btn onClick={() => setNoteFor(null)}>Cancel</Btn>
+                    <Btn variant="primary" onClick={saveNote} disabled={isSavingNote}>{isSavingNote ? 'Saving…' : 'Add note'}</Btn>
+                </>}
+            >
+                <textarea
+                    className={TEXTAREA}
+                    rows={4}
+                    autoFocus
+                    placeholder="e.g. Customer asked for delivery after 5 pm"
+                    value={noteText}
+                    onChange={(e) => setNoteText(e.target.value)}
+                />
+                <p className="mt-2 text-xs text-gray-400">Staff-only. It is added to the order’s timeline.</p>
+            </Modal>
+
+            <PrintOrdersModal job={printJob} onClose={() => setPrintJob(null)} />
+        </div>
+    );
+}
