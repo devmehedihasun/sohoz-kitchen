@@ -1,10 +1,23 @@
 import type { MetadataRoute } from 'next';
 
-const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000';
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/api';
+export const dynamic = 'force-dynamic';
 
-// Revalidate the sitemap hourly so new products/categories show up.
-export const revalidate = 3600;
+const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || 'https://shohozkitchen.vercel.app';
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'https://shohozkitchen-server.onrender.com/api';
+
+// ৩ সেকেন্ডের মধ্যে রেসপন্স না পেলে ফেচ ক্যান্সেল করার হেল্পার
+const fetchWithTimeout = async (url: string, timeoutMs = 3000) => {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const response = await fetch(url, { signal: controller.signal, cache: 'no-store' });
+        clearTimeout(id);
+        return response;
+    } catch {
+        clearTimeout(id);
+        return null;
+    }
+};
 
 export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
     const now = new Date();
@@ -21,8 +34,8 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
 
     // ── Products ─────────────────────────────────────────────────────
     try {
-        const res = await fetch(`${API_BASE}/products?limit=200`, { next: { revalidate } });
-        if (res.ok) {
+        const res = await fetchWithTimeout(`${API_BASE}/products?limit=200`);
+        if (res && res.ok) {
             const json = await res.json();
             const products: any[] = Array.isArray(json?.data) ? json.data : [];
             for (const p of products) {
@@ -37,13 +50,13 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
             }
         }
     } catch {
-        // Network/API failure — fall through with static routes only.
+        // Fallback to static routes
     }
 
     // ── Categories ───────────────────────────────────────────────────
     try {
-        const res = await fetch(`${API_BASE}/categories`, { next: { revalidate } });
-        if (res.ok) {
+        const res = await fetchWithTimeout(`${API_BASE}/categories`);
+        if (res && res.ok) {
             const json = await res.json();
             const categories: any[] = Array.isArray(json?.data) ? json.data : [];
             for (const c of categories) {
@@ -58,7 +71,7 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
             }
         }
     } catch {
-        // Network/API failure — fall through with static routes only.
+        // Fallback to static routes
     }
 
     return [...staticRoutes, ...dynamicRoutes];
